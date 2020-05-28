@@ -132,7 +132,7 @@ steps:
       }
       Write-Output "##vso[task.setvariable variable=bis-internal_ip]$($bis_internal_ip)"
 
-- task: TerraformTaskV1@0
+- task: TerraformCLI@0
   displayName: 'Terraform init layer 1'
   inputs:
     provider: 'azurerm'
@@ -145,7 +145,7 @@ steps:
     backendAzureRmContainerName: '$(backend_container_name)'
     backendAzureRmKey: '$(backend_layer_1_key)'
 
-- task: TerraformTaskV1@0
+- task: TerraformCLI@0
   displayName: 'Terraform plan layer 1'
   name: terraformPlanLayer1
   inputs:
@@ -155,7 +155,7 @@ steps:
     commandOptions: '--out $(Agent.TempDirectory)/layer.plan --var="namedEnvironment=$(namedEnvironment)"   --var="external_web_ip=$(bis-external_ip)"  --var="internal_web_ip=$(bis-internal_ip)" --var-file $(Agent.TempDirectory)/service-ips.json --var="shared_build_agent_subnet=$(shared_build_agent_subnet)" --var="env_specifier=$(environment)" --var="environment_level=$(environment_level)" --var="bis_db_name=$(bisDatabaseName)" --var="bis_stage_db_name=$(bisStageDatabaseName)" --var-file $(System.DefaultWorkingDirectory)/config/$(environment_level)/env.backend.tfvars.json --var-file $(System.DefaultWorkingDirectory)/config/$(environment_level)/env.tfvars --var-file $(System.DefaultWorkingDirectory)/config/$(environment_level)/layer-1.tfvars'
     environmentServiceNameAzureRM: 'WcbBis$(environment_level)Automation'
 
-- task: TerraformTaskV1@0
+- task: TerraformCLI@0
   displayName: 'Terraform validate and apply layer 1'
   condition: eq(variables['alsoDeploy'], true)
   inputs:
