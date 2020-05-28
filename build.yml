@@ -1,0 +1,166 @@
+pool:
+  name: 'bis-hosted-linux'
+
+variables:
+  alsoDeploy: $[ or(eq(variables['forceDeploy'],'true'), eq(variables['Build.SourceBranch'], 'refs/heads/develop')) ]
+  namedEnvironment: $[ eq(variables['environment'], variables['environment_level'])]
+  backend_layer_1_key: bis-$(environment_level)-$(environment).layer-1.terraform.tfstate
+  shared_build_agent_subnet: /subscriptions/e634c783-5a1d-4b77-8878-5964db6a5a31/resourceGroups/wcb-shared-services/providers/Microsoft.Network/virtualNetworks/WCB-HUB-VNET-01/subnets/WCB-COMMON-SERVICES
+
+  #Append to end of list, or else dns records may be temporarily destroyed! ( records update in sequence )
+  serviceNames: entity-service,reference-service,user-service,external-user-service,document-service,notification-service
+
+steps:
+- task: PowerShell@2
+  displayName: 'Convert backend config to variables'
+  inputs:
+    targetType: 'inline'
+    script: |
+      Write-Output "DEBUG: namedEnvironment=$(namedEnvironment)"
+      $backendEnv = Get-Content $(System.DefaultWorkingDirectory)/config/$(environment_level)/env.backend.tfvars.json | ConvertFrom-Json
+      Write-Output "##vso[task.setvariable variable=backend_resource_group_name`]$($backendEnv.resource_group_name)"
+      Write-Output "##vso[task.setvariable variable=backend_storage_account_name]$($backendEnv.storage_account_name)"
+      Write-Output "##vso[task.setvariable variable=backend_container_name]$($backendEnv.container_name)"
+      Write-Output "##vso[task.setvariable variable=layer_0_key]$($backendEnv.layer_0_key)"
+    pwsh: true
+
+- task: AzureCLI@2
+  displayName: 'Extract vars from state'
+  timeoutInMinutes: 15
+  inputs:
+    azureSubscription: 'WcbBis$(environment_level)Automation'
+    scriptType: 'pscore'
+    scriptLocation: 'inlineScript'    
+    powerShellIgnoreLASTEXITCODE: true
+    inlineScript: |
+      if ('$(namedEnvironment)' -eq 'True'){
+        $bisDatabaseName='BIS'
+        $bisStageDatabaseName='BIS_Stage'
+      } else {
+        $bisDatabaseName='BIS_$(environment)'
+        $bisStageDatabaseName='XXX'
+      }
+      Write-Output "##vso[task.setvariable variable=bisDatabaseName]$($bisDatabaseName)"
+      Write-Output "##vso[task.setvariable variable=bisStageDatabaseName]$($bisStageDatabaseName)"
+
+
+      az storage blob download --container-name $(backend_container_name) --account-name $(backend_storage_account_name) --name $(layer_0_key) --file $(Agent.TempDirectory)/layer0.tfstate   
+
+      $bis_managed_instance=(terraform output -state="$(Agent.TempDirectory)/layer0.tfstate" sql_primary_name) | Out-String
+      $bis_managed_instance=$bis_managed_instance.trim()
+      Write-Output "##vso[task.setvariable variable=bis_managed_instance]$($bis_managed_instance)"
+      $bis_resource_group=(terraform output -state="$(Agent.TempDirectory)/layer0.tfstate" application_resource_group_name) | Out-String
+      $bis_resource_group=$bis_resource_group.trim()
+      Write-Output "##vso[task.setvariable variable=bis_resource_group]$($bis_resource_group)"
+
+      $private_dns_zone_domain_name=(terraform output -state="$(Agent.TempDirectory)/layer0.tfstate" private_dns_zone_domain_name) | Out-String
+      $private_dns_zone_domain_name=$private_dns_zone_domain_name.trim()
+      Write-Output "##vso[task.setvariable variable=private_dns_zone_domain_name]$($private_dns_zone_domain_name)"
+
+- task: AzureCLI@2
+  displayName: 'Create BIS Database'
+  condition: eq(variables['alsoDeploy'], true)
+  timeoutInMinutes: 15
+  inputs:
+    azureSubscription: 'WcbBis$(environment_level)Automation'
+    scriptType: 'pscore'
+    scriptLocation: 'inlineScript'    
+    powerShellIgnoreLASTEXITCODE: true
+    inlineScript: |
+      az resource create --resource-group $(bis_resource_group) --namespace Microsoft.Sql --parent managedInstances/$(bis_managed_instance) --resource-type databases --name $(bisDatabaseName) --api-version 2017-03-01-preview --verbose --debug --properties '{\"location\": \"usgovvirginia\"}'
+
+      if ('$(namedEnvironment)' -eq 'True'){
+        Write-Output "Creating DB: $(bisStageDatabaseName)"
+        az resource create --resource-group $(bis_resource_group) --namespace Microsoft.Sql --parent managedInstances/$(bis_managed_instance) --resource-type databases --name $(bisStageDatabaseName) --api-version 2017-03-01-preview --verbose --debug --properties '{\"location\": \"usgovvirginia\"}'
+      }
+
+## Application Gateways are not able to be in the adhoc environments.
+## Terraform does not have a clean way to optionally invoke a module.
+## The file app-gateway.tf invokes the app-gateway module and outputs any
+## outputs needed.
+##
+## Delete the file for the adhoc environments so that an Application Gateway is created.
+- task: Bash@3
+  displayName: Remove Optional Application Gateway
+  name: updateManifests
+  condition: ne(variables['namedEnvironment'], true)
+  inputs:
+    targetType: 'inline'
+    script: |
+       rm $(System.DefaultWorkingDirectory)/layer/app-gateway.tf
+       echo "{ \"services\" : [] }" > $(Agent.TempDirectory)/service-ips.json
+
+
+## To impleemented blue/gree deployments the application gateway uses private DNS entries in the backend pools.
+## The app-gateway module creates those DNS entries and populates them with a value.
+## We don't want to change the values of those entries if we are re-running the terraform script.
+## So we need to look up the existing values of those DNS entries and pass those values into terraform.
+## If there are no valus then use 127.0.0.1.
+## Durling layer 2 release these DNS entries will be updated to the appropriate Kubernetes external IP addresses.
+- task: AzureCLI@2
+  displayName: 'Obtain Current IP Addresses from DNS'
+  condition: eq(variables['namedEnvironment'], true)
+  inputs:
+    azureSubscription: 'WcbBis$(environment_level)Automation'
+    scriptType: 'pscore'
+    scriptLocation: 'inlineScript'    
+    powerShellIgnoreLASTEXITCODE: true
+    inlineScript: |
+      $wrappedServices=@{services=@()}
+      foreach ($service in "$(serviceNames)".split(",")){
+        $entry=@{name=$service}
+        $ip = $(az network private-dns record-set a show --resource-group $(bis_resource_group) --zone-name $(private_dns_zone_domain_name)  --name $service --query "aRecords[0].ipv4Address" --out tsv)
+        if ($LASTEXITCODE -eq 0){
+          $entry['ip']=$ip
+        } else {
+          $entry['ip']='127.0.0.1'
+        }
+        $wrappedServices.services+=$entry
+      }
+
+      $wrappedServices | ConvertTo-Json > $(Agent.TempDirectory)/service-ips.json
+
+      $bis_external_ip = $(az network private-dns record-set a show --resource-group $(bis_resource_group) --zone-name $(private_dns_zone_domain_name)  --name bis-external --query "aRecords[0].ipv4Address" --out tsv)
+      if ($LASTEXITCODE -ne 0){
+        $bis_external_ip="127.0.0.1"
+      }
+      Write-Output "##vso[task.setvariable variable=bis-external_ip]$($bis_external_ip)"
+
+      $bis_internal_ip = $(az network private-dns record-set a show --resource-group $(bis_resource_group) --zone-name $(private_dns_zone_domain_name)  --name bis-internal --query "aRecords[0].ipv4Address")
+      if ($LASTEXITCODE -ne 0){
+        $bis_internal_ip="127.0.0.1"
+      }
+      Write-Output "##vso[task.setvariable variable=bis-internal_ip]$($bis_internal_ip)"
+
+- task: TerraformTaskV1@0
+  displayName: 'Terraform init layer 1'
+  inputs:
+    provider: 'azurerm'
+    command: 'init'
+    workingDirectory: '$(System.DefaultWorkingDirectory)/layer'
+    commandOptions: '-backend-config=$(System.DefaultWorkingDirectory)/config/$(environment_level)/env.backend.tfvars.json'
+    backendServiceArm: 'WcbBis$(environment_level)Automation'
+    backendAzureRmResourceGroupName: '$(backend_resource_group_name)'
+    backendAzureRmStorageAccountName: '$(backend_storage_account_name)'
+    backendAzureRmContainerName: '$(backend_container_name)'
+    backendAzureRmKey: '$(backend_layer_1_key)'
+
+- task: TerraformTaskV1@0
+  displayName: 'Terraform plan layer 1'
+  name: terraformPlanLayer1
+  inputs:
+    provider: 'azurerm'
+    command: 'plan'
+    workingDirectory: '$(System.DefaultWorkingDirectory)/layer'
+    commandOptions: '--out $(Agent.TempDirectory)/layer.plan --var="namedEnvironment=$(namedEnvironment)"   --var="external_web_ip=$(bis-external_ip)"  --var="internal_web_ip=$(bis-internal_ip)" --var-file $(Agent.TempDirectory)/service-ips.json --var="shared_build_agent_subnet=$(shared_build_agent_subnet)" --var="env_specifier=$(environment)" --var="environment_level=$(environment_level)" --var="bis_db_name=$(bisDatabaseName)" --var="bis_stage_db_name=$(bisStageDatabaseName)" --var-file $(System.DefaultWorkingDirectory)/config/$(environment_level)/env.backend.tfvars.json --var-file $(System.DefaultWorkingDirectory)/config/$(environment_level)/env.tfvars --var-file $(System.DefaultWorkingDirectory)/config/$(environment_level)/layer-1.tfvars'
+    environmentServiceNameAzureRM: 'WcbBis$(environment_level)Automation'
+
+- task: TerraformTaskV1@0
+  displayName: 'Terraform validate and apply layer 1'
+  condition: eq(variables['alsoDeploy'], true)
+  inputs:
+    provider: 'azurerm'
+    command: 'apply'
+    workingDirectory: '$(System.DefaultWorkingDirectory)/layer'
+    commandOptions: '$(Agent.TempDirectory)/layer.plan'
+    environmentServiceNameAzureRM: 'WcbBis$(environment_level)Automation'
